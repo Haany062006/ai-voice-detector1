@@ -4,5 +4,5 @@ transformers
 torch
 librosa
 numpy
-python-multipart
 soundfile
+python-multipart
