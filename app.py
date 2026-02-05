@@ -2,12 +2,24 @@ import base64
 import io
 import numpy as np
 import librosa
+import soundfile as sf
+import torch
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification
 
 app = FastAPI()
 
-# Your API Key (keep same as you used before)
+# ======== Load REAL Deepfake Detection Model ========
+MODEL_NAME = "jonatasgrosman/wav2vec2-large-xlsr-53-english-deepfake"
+
+print("Loading AI voice detection model... this may take 1–2 minutes on first run.")
+
+feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_NAME)
+model = Wav2Vec2ForSequenceClassification.from_pretrained(MODEL_NAME)
+model.eval()
+
 VALID_API_KEY = "sk_test_123456789"
 
 # -------- Request Model --------
@@ -16,50 +28,36 @@ class AudioRequest(BaseModel):
     audioFormat: str
     audioBase64: str
 
-# -------- Feature Extraction Function --------
-def extract_features(audio_bytes):
-    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000)
+def load_audio_from_base64(b64_string):
+    """Decode Base64 and convert to proper waveform"""
+    audio_bytes = base64.b64decode(b64_string)
+    audio_buffer = io.BytesIO(audio_bytes)
 
-    # Extract key audio features used in deepfake detection
-    features = {
-        "mean_pitch": float(np.mean(librosa.yin(y, fmin=50, fmax=300))),
-        "pitch_variance": float(np.var(librosa.yin(y, fmin=50, fmax=300))),
-        "spectral_centroid": float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))),
-        "spectral_bandwidth": float(np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))),
-        "zero_crossing_rate": float(np.mean(librosa.feature.zero_crossing_rate(y)))
-    }
-    return features
+    # Load audio at 16kHz (model requirement)
+    waveform, sample_rate = librosa.load(audio_buffer, sr=16000)
+    return waveform
 
-# -------- Simple AI vs Human Decision Logic (Dynamic) --------
-def classify_voice(features):
-    # Heuristic model (simulates AI detection based on real audio properties)
+def predict_deepfake(waveform):
+    """Run real AI model on the audio"""
+    inputs = feature_extractor(
+        waveform, 
+        sampling_rate=16000, 
+        return_tensors="pt"
+    )
 
-    score = 0
+    with torch.no_grad():
+        logits = model(**inputs).logits
 
-    # Rule 1: AI voices tend to have VERY stable pitch
-    if features["pitch_variance"] < 20:
-        score += 0.4
+    # Convert logits to probability
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    ai_prob = float(probs[0][1])   # Probability of AI-generated
+    human_prob = float(probs[0][0])
 
-    # Rule 2: AI voices often have unnatural spectral patterns
-    if features["spectral_centroid"] < 1500:
-        score += 0.3
+    return ai_prob, human_prob
 
-    # Rule 3: AI voices often have low natural variability
-    if features["zero_crossing_rate"] < 0.05:
-        score += 0.3
-
-    # Final decision
-    if score >= 0.5:
-        return "AI_GENERATED", round(score, 2), "Low pitch variation and synthetic spectral patterns detected"
-    else:
-        return "HUMAN", round(1 - score, 2), "Natural pitch variations and organic speech patterns detected"
-
-# -------- API Endpoint --------
 @app.post("/api/voice-detection")
-def detect_voice(
-    request: AudioRequest,
-    x_api_key: str = Header(None)
-):
+def detect_voice(request: AudioRequest, x_api_key: str = Header(None)):
+
     # ---- API Key Validation ----
     if x_api_key != VALID_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -69,17 +67,23 @@ def detect_voice(
     if request.language not in supported_languages:
         raise HTTPException(status_code=400, detail="Unsupported language")
 
-    # ---- Decode Base64 Audio ----
+    # ---- Decode Audio ----
     try:
-        audio_bytes = base64.b64decode(request.audioBase64)
-    except:
+        waveform = load_audio_from_base64(request.audioBase64)
+    except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid Base64 audio")
 
-    # ---- Extract Features ----
-    features = extract_features(audio_bytes)
+    # ---- Run REAL AI Model ----
+    ai_prob, human_prob = predict_deepfake(waveform)
 
-    # ---- Classify ----
-    classification, confidence, explanation = classify_voice(features)
+    if ai_prob > human_prob:
+        classification = "AI_GENERATED"
+        confidence = round(ai_prob, 2)
+        explanation = "Model detected synthetic artifacts consistent with AI-generated speech."
+    else:
+        classification = "HUMAN"
+        confidence = round(human_prob, 2)
+        explanation = "Model detected natural speech variations consistent with human voice."
 
     return {
         "status": "success",
